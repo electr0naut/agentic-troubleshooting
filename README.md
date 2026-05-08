@@ -29,6 +29,9 @@ python3 troubleshooter.py --host prod-server-01 --user ops
 
 # Remote host with symptom
 python3 troubleshooter.py --host prod-server-01 --user ops --symptom "slow disk io"
+
+# Custom thresholds
+python3 troubleshooter.py --pid 12345 --config /path/to/settings.cfg
 ```
 
 ## How It Works
@@ -83,6 +86,28 @@ The `--symptom` flag forces investigation branches even when metrics don't cross
 | `network`, `net`, `connection`, `slow` | Network investigation |
 
 Multiple keywords can match: `--symptom "slow disk io"` triggers both I/O and network branches.
+
+## Configuration
+
+All thresholds and tuning parameters live in `settings.cfg`. The troubleshooter loads it automatically from the project directory, or you can point to a custom copy:
+
+```bash
+python3 troubleshooter.py --config /path/to/settings.cfg
+```
+
+Sections and what they control:
+
+| Section | Examples |
+|---|---|
+| `[timeouts]` | Command timeout, SSH timeout, investigation budget, log lookback window |
+| `[cpu]` | Process %CPU thresholds, load-to-cores ratios, spike/sustained multipliers |
+| `[memory]` | Process %MEM threshold, RSS warning, VSZ ratio, swap attribution, leak detection |
+| `[io]` | REG FD ratio, I/O-bound heuristics, disk usage critical threshold |
+| `[fd]` | FD usage ratios (warning/critical), pipe count, growth leak detection |
+| `[network]` | Connection count thresholds, CLOSE_WAIT warning, endpoint concentration |
+| `[output]` | Display limits for top processes, threads, log lines, connections |
+
+Every value has a sensible default built into the code, so `settings.cfg` is optional — the troubleshooter runs fine without it.
 
 ## Running the Test Suite
 
@@ -141,6 +166,7 @@ The troubleshooter detects the OS at runtime and uses platform-appropriate comma
 ```
 agentic-troubleshooting/
   troubleshooter.py          # The agent — run this
+  settings.cfg               # Configurable thresholds and tuning
   TROUBLESHOOTING_RUNBOOK.md # Decision tree documentation
   run_all_tests.py           # Test runner for all 5 scenarios
   cpu_burner.py              # Test dummy: CPU saturation
