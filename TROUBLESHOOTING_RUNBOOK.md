@@ -4,6 +4,112 @@ A logical decision tree for automated Linux server troubleshooting via SSH. Desi
 
 ---
 
+## 0. General Guidelines — Do No Harm
+
+**The investigation must not make the problem worse.** These hosts run production trading infrastructure where added latency, CPU spikes, or memory pressure from diagnostic commands can directly impact quant traders. Every command the agent runs must be evaluated against this principle.
+
+### 0.1 Command Safety Classification
+
+```
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  SAFE (always allowed)                                             │
+  │    Read-only, negligible overhead:                                 │
+  │    uptime, free, lscpu, nproc, uname, hostname, whoami,           │
+  │    cat /proc/<pid>/status, cat /proc/<pid>/limits,                │
+  │    cat /proc/<pid>/io, cat /proc/meminfo, cat /proc/loadavg,     │
+  │    cat /proc/sys/fs/file-nr, ps (all variants),                   │
+  │    ss -tnp, df -h, mount, id, ulimit                              │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  LIGHT (allowed, use sensible defaults)                            │
+  │    Low overhead but can accumulate if misused:                     │
+  │    top -bn1 (single snapshot, NOT interactive/continuous),         │
+  │    iostat -x 1 3 (short burst, max 3–5 iterations),               │
+  │    vmstat 1 5 (short burst),                                       │
+  │    lsof -p <pid> (single-process scope only),                     │
+  │    dmesg -T | tail, journalctl (bounded time range + tail)         │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  MODERATE (use with caution, prefer alternatives)                  │
+  │    Noticeable overhead on busy systems:                            │
+  │    lsof (system-wide, no -p) — scans all FDs, use only if needed, │
+  │    find / -name ... — full filesystem walk, scope to specific dirs,│
+  │    pmap -x <pid> — reads /proc/<pid>/smaps, brief delay,          │
+  │    netstat (deprecated, prefer ss — faster and lighter)            │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  HEAVY (require explicit justification + short duration)           │
+  │    Can add measurable load or alter process behavior:              │
+  │    strace -cp <pid> — attaches via ptrace, ALWAYS use timeout,    │
+  │      NEVER exceed 5 seconds, NEVER on latency-critical path       │
+  │      during market hours without operator approval,                │
+  │    perf top / perf record — CPU sampling overhead,                 │
+  │    tcpdump — packet capture, use BPF filter + short duration,     │
+  │    iotop — refreshes /proc for all processes                       │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  FORBIDDEN (never run during automated investigation)              │
+  │    kill, pkill, renice, ionice, cgroup modifications,             │
+  │    dd, fsck, mkfs, any write to /proc or /sys tunables,           │
+  │    gdb attach (stops the process),                                 │
+  │    stress, fio, sysbench (load generators),                        │
+  │    rm, mv, chmod, chown on system or application files,            │
+  │    service/systemctl stop|restart (unless explicitly authorized)   │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+### 0.2 Resource Budgets
+
+The agent must self-limit to avoid becoming part of the problem:
+
+| Resource | Limit | Rationale |
+|---|---|---|
+| Concurrent SSH sessions | 1 per host | Avoid connection table pressure |
+| Command parallelism | Sequential only | No background forks on target host |
+| strace / perf duration | ≤ 5 seconds | ptrace adds syscall overhead per call |
+| iostat / vmstat iterations | ≤ 5 | Enough for a trend, not a benchmark |
+| lsof scope | Single PID (`-p`) | System-wide lsof scans /proc entirely |
+| Log reads | `tail` or bounded `--since` | Never `cat` an unbounded log file |
+| Total investigation time per host | ≤ 5 minutes | Escalate if unresolved, don't camp |
+| Temp files on target | Zero | Write nothing to the remote filesystem |
+
+### 0.3 Behavioral Rules
+
+1. **Read-only posture.** The agent observes — it does not modify, restart, kill, or tune. It **never** offers to restart or kill processes or network connections, even if they are suspected root causes. When remediation is needed, it provides the operator with the **exact command to run** in a separate terminal, at their own discretion.
+
+2. **No writes to the remote host.** Do not create temp files, redirect output to files, or pipe through `tee` on the target. All output is captured over the SSH channel and processed locally.
+
+3. **Scope commands tightly.** Always prefer `lsof -p <pid>` over `lsof`. Always prefer `journalctl --since "10 minutes ago" | tail -50` over unbounded reads. Always prefer `ps -p <pid>` over `ps aux` when a PID is known.
+
+4. **Short bursts, not continuous monitoring.** Use `top -bn1` (single snapshot), not `top -bn100`. Use `iostat -x 1 3`, not `iostat -x 1 60`. If more data is needed, take another short burst after analysis — don't run long-duration collectors.
+
+5. **Never attach to latency-critical processes without approval.** strace, perf, and gdb add overhead. If the target PID is a gateway, OMS, or feed handler in active trading, the agent must flag this and request explicit operator approval before attaching.
+
+6. **Fail safe on timeout.** If a diagnostic command hangs (e.g., lsof on an NFS-stale mount), it must be wrapped with `timeout`. Default: 10 seconds per command. If it times out, log it and move on — do not retry.
+
+7. **Exit cleanly.** On abort, error, or completion, ensure no orphan processes are left on the remote host. Use `timeout` wrappers and avoid backgrounding commands on the target.
+
+8. **Log everything locally.** Every command sent and every response received is logged on the agent side for audit trail and post-incident review. Nothing is written to the remote host.
+
+### 0.4 Command Wrappers
+
+All remote commands should be executed through a safety wrapper:
+
+```bash
+# Every command on the remote host is wrapped with a timeout
+# Default 10s, adjustable per command class
+timeout ${CMD_TIMEOUT:-10} <command>
+
+# strace is always double-guarded
+timeout 5 strace -cp <pid> 2>&1
+
+# Log reads are always bounded
+journalctl --since "10 minutes ago" --priority=warning --no-pager | tail -50
+dmesg -T | tail -30
+
+# Never run without scope
+lsof -p <pid>        # yes
+lsof                  # no — too broad
+```
+
+---
+
 ## 1. Entry Point
 
 The agent is triggered with:
@@ -166,7 +272,8 @@ ps -p <pid> -L -o tid,%cpu,comm | sort -k2 -rn | head -20
 # For Java/JVM processes
 # jstack <pid> | grep -A 2 "nid=<hex_tid>"
 
-# strace snapshot (brief, non-intrusive)
+# strace snapshot — HEAVY: requires operator approval for latency-critical processes (see §0.1)
+# Always timeout-guarded, never during active market hours without approval
 timeout 5 strace -cp <pid> 2>&1
 ```
 
