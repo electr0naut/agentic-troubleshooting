@@ -165,24 +165,14 @@ The troubleshooter detects the OS at runtime and uses platform-appropriate comma
 
 ```
 agentic-troubleshooting/
-  troubleshooter.py              # Entry point — run this
-  settings.cfg                   # Configurable thresholds and tuning
-  TROUBLESHOOTING_RUNBOOK.md     # Decision tree documentation
-  modules/
-    config.py                    # Settings loader (configparser)
-    models.py                    # Finding and Report dataclasses
-    runner.py                    # CommandRunner (local / SSH execution)
-    core.py                      # Troubleshooter orchestrator (triage + deep-dive)
-    cpu.py                       # §4 CPU investigation
-    memory.py                    # §5 Memory investigation
-    disk_io.py                   # §6 I/O investigation
-    fd.py                        # §7 File descriptor investigation
-    network.py                   # §8 Network investigation
+  troubleshooter.py          # The agent — single file, scp and run
+  settings.cfg               # Configurable thresholds and tuning
+  TROUBLESHOOTING_RUNBOOK.md # Decision tree documentation
   tests/
-    run_all_tests.py             # Test runner for all 5 scenarios
-    cpu_burner.py                # Test dummy: CPU saturation
-    mem_hog.py                   # Test dummy: memory pressure
-    io_slowpoke.py               # Test dummy: I/O pressure
-    fd_leaker.py                 # Test dummy: FD exhaustion
-    net_congestion.py            # Test dummy: network congestion
+    run_all_tests.py         # Test runner for all 5 scenarios
+    cpu_burner.py            # Test dummy: CPU saturation
+    mem_hog.py               # Test dummy: memory pressure
+    io_slowpoke.py           # Test dummy: I/O pressure
+    fd_leaker.py             # Test dummy: FD exhaustion
+    net_congestion.py        # Test dummy: network congestion
 ```
