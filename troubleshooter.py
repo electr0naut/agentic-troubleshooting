@@ -10,6 +10,7 @@ is needed, it provides the operator with the exact command to run — elsewhere,
 at their discretion.
 """
 import argparse
+import configparser
 import os
 import subprocess
 import shlex
@@ -19,22 +20,74 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.cfg")
 
-CMD_TIMEOUT = 10
-INVESTIGATION_TIMEOUT = 300  # 5 minutes max per host
 
-# Thresholds
-CPU_HIGH_PCT = 50.0
-MEM_HIGH_PCT = 50.0
-FD_WARNING_RATIO = 0.5
-FD_CRITICAL_RATIO = 0.8
-LOAD_HEALTHY = 0.7
-LOAD_SATURATED = 1.0
-LOAD_OVERLOADED = 2.0
-CONN_WARNING = 50
-CONN_CRITICAL = 200
-CLOSE_WAIT_WARNING = 5
-DISK_USAGE_WARNING = 90
+def load_config(path=None):
+    cfg = configparser.ConfigParser()
+    cfg.read(path or SETTINGS_PATH)
+
+    def g(section, key, fallback, cast=None):
+        raw = cfg.get(section, key, fallback=str(fallback))
+        return (cast or type(fallback))(raw)
+
+    return {
+        # [timeouts]
+        "command_timeout_secs":        g("timeouts", "command_timeout_secs", 10, int),
+        "slow_command_timeout_secs":   g("timeouts", "slow_command_timeout_secs", 15, int),
+        "investigation_budget_secs":   g("timeouts", "investigation_budget_secs", 300, int),
+        "ssh_connect_timeout_secs":    g("timeouts", "ssh_connect_timeout_secs", 5, int),
+        "log_lookback_minutes":        g("timeouts", "log_lookback_minutes", 10, int),
+        # [cpu]
+        "cpu_process_high_pct":        g("cpu", "process_high_pct", 50.0, float),
+        "cpu_process_critical_pct":    g("cpu", "process_critical_pct", 95.0, float),
+        "cpu_load_ratio_healthy":      g("cpu", "load_ratio_healthy", 0.7, float),
+        "cpu_load_ratio_saturated":    g("cpu", "load_ratio_saturated", 1.0, float),
+        "cpu_load_ratio_overloaded":   g("cpu", "load_ratio_overloaded", 2.0, float),
+        "cpu_load_spike_multiplier":   g("cpu", "load_spike_multiplier", 1.5, float),
+        "cpu_load_sustained_mult":     g("cpu", "load_sustained_multiplier", 1.3, float),
+        "cpu_load_stable_tolerance":   g("cpu", "load_stable_tolerance", 0.2, float),
+        "cpu_load_sustained_tol":      g("cpu", "load_sustained_tolerance", 0.3, float),
+        # [memory]
+        "mem_process_high_pct":        g("memory", "process_high_pct", 50.0, float),
+        "mem_rss_warning_mb":          g("memory", "process_rss_warning_mb", 100, int),
+        "mem_vsz_rss_ratio_warning":   g("memory", "vsz_rss_ratio_warning", 10, int),
+        "mem_vsz_absolute_warning_mb": g("memory", "vsz_absolute_warning_mb", 1000, int),
+        "mem_swap_attribution_pct":    g("memory", "swap_attribution_min_pct", 5.0, float),
+        "mem_compression_warning_mb":  g("memory", "compression_warning_mb", 2048, int),
+        "mem_proc_swap_warning_mb":    g("memory", "process_swap_warning_mb", 100, int),
+        "mem_rss_sample_interval":     g("memory", "rss_sample_interval_secs", 3, int),
+        "mem_rss_sample_count":        g("memory", "rss_sample_count", 3, int),
+        "mem_rss_growth_warning_pct":  g("memory", "rss_growth_warning_pct", 5.0, float),
+        # [io]
+        "io_reg_fd_ratio_warning":     g("io", "reg_fd_ratio_warning", 0.5, float),
+        "io_reg_fd_count_min":         g("io", "reg_fd_count_min", 10, int),
+        "io_iobound_cpu_max_pct":      g("io", "iobound_cpu_max_pct", 10.0, float),
+        "io_iobound_cumtime_secs":     g("io", "iobound_cumulative_time_secs", 60, int),
+        "io_disk_usage_critical_pct":  g("io", "disk_usage_critical_pct", 90, int),
+        # [fd]
+        "fd_usage_ratio_warning":      g("fd", "usage_ratio_warning", 0.5, float),
+        "fd_usage_ratio_critical":     g("fd", "usage_ratio_critical", 0.8, float),
+        "fd_dir_leak_threshold":       g("fd", "dir_fd_leak_threshold", 20, int),
+        "fd_pipe_warning":             g("fd", "pipe_fd_warning", 20, int),
+        "fd_growth_active_leak":       g("fd", "growth_active_leak", 5, int),
+        "fd_sample_interval":          g("fd", "fd_sample_interval_secs", 5, int),
+        "fd_sample_count":             g("fd", "fd_sample_count", 3, int),
+        # [network]
+        "net_conn_count_warning":      g("network", "connection_count_warning", 50, int),
+        "net_conn_count_critical":     g("network", "connection_count_critical", 200, int),
+        "net_close_wait_warning":      g("network", "close_wait_warning", 5, int),
+        "net_endpoint_conc_warning":   g("network", "endpoint_concentration_warning", 10, int),
+        "net_display_max_conns":       g("network", "display_max_connections", 20, int),
+        # [output]
+        "out_top_process_count":       g("output", "top_process_count", 20, int),
+        "out_top_thread_count":        g("output", "top_thread_count", 20, int),
+        "out_max_reg_files":           g("output", "max_reg_files_shown", 30, int),
+        "out_max_file_paths":          g("output", "max_file_paths_shown", 10, int),
+        "out_max_dir_groups":          g("output", "max_dir_groups_shown", 3, int),
+        "out_max_log_lines":           g("output", "max_log_lines", 20, int),
+        "out_max_netstat_lines":       g("output", "max_netstat_lines", 100, int),
+    }
 
 
 @dataclass
@@ -71,19 +124,23 @@ class Report:
 class CommandRunner:
     """Executes commands locally or over SSH with timeout wrapping."""
 
-    def __init__(self, host=None, ssh_user=None):
+    def __init__(self, host=None, ssh_user=None, cfg=None):
         self.host = host
         self.ssh_user = ssh_user
         self.is_local = host in (None, "localhost", "127.0.0.1")
         self.is_darwin = False
         self.log = []
+        self.cfg = cfg or load_config()
 
-    def run(self, cmd, timeout=CMD_TIMEOUT):
+    def run(self, cmd, timeout=None):
+        if timeout is None:
+            timeout = self.cfg["command_timeout_secs"]
         if self.is_local:
             full_cmd = cmd
         else:
             remote = f"{self.ssh_user}@{self.host}" if self.ssh_user else self.host
-            full_cmd = f"ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new {remote} {shlex.quote(cmd)}"
+            ssh_to = self.cfg["ssh_connect_timeout_secs"]
+            full_cmd = f"ssh -o ConnectTimeout={ssh_to} -o StrictHostKeyChecking=accept-new {remote} {shlex.quote(cmd)}"
 
         entry = {"time": datetime.now().isoformat(), "cmd": cmd, "host": self.host or "localhost"}
         try:
@@ -109,8 +166,9 @@ class CommandRunner:
 
 
 class Troubleshooter:
-    def __init__(self, runner: CommandRunner, pid=None, symptom=None):
+    def __init__(self, runner: CommandRunner, pid=None, symptom=None, cfg=None):
         self.runner = runner
+        self.cfg = cfg or runner.cfg
         self.initial_pid = pid
         self.symptom = symptom
         self.report = Report(
@@ -124,8 +182,9 @@ class Troubleshooter:
         return time.monotonic() - self.start_time
 
     def over_budget(self):
-        if self.elapsed() > INVESTIGATION_TIMEOUT:
-            self._finding("info", "info", f"Investigation time limit reached ({INVESTIGATION_TIMEOUT}s)")
+        budget = self.cfg["investigation_budget_secs"]
+        if self.elapsed() > budget:
+            self._finding("info", "info", f"Investigation time limit reached ({budget}s)")
             return True
         return False
 
@@ -198,8 +257,9 @@ class Troubleshooter:
             self._finding("info", "info", "No high-CPU processes found")
             return None
 
+        cpu_high = self.cfg["cpu_process_high_pct"]
         candidate = top_procs[0]
-        if candidate["cpu"] > CPU_HIGH_PCT:
+        if candidate["cpu"] > cpu_high:
             self._finding("cpu", "warning",
                           f"Top CPU consumer: PID {candidate['pid']} ({candidate['name']}) at {candidate['cpu']:.1f}%")
             return candidate["pid"]
@@ -207,7 +267,7 @@ class Troubleshooter:
             return d_procs[0]
         elif top_procs:
             self._finding("info", "info",
-                          f"No process above {CPU_HIGH_PCT}% CPU — examining top consumer PID {candidate['pid']}")
+                          f"No process above {cpu_high}% CPU — examining top consumer PID {candidate['pid']}")
             return candidate["pid"]
         return None
 
@@ -237,20 +297,26 @@ class Troubleshooter:
         r15 = self.report.load_15m / cores
         print(f"\n  Load / cores ratio:  1m={r1:.2f}  5m={r5:.2f}  15m={r15:.2f}")
 
-        if r1 >= LOAD_OVERLOADED:
+        c = self.cfg
+        if r1 >= c["cpu_load_ratio_overloaded"]:
             self._finding("cpu", "critical", f"System severely overloaded — load/cores = {r1:.2f}")
-        elif r1 >= LOAD_SATURATED:
+        elif r1 >= c["cpu_load_ratio_saturated"]:
             self._finding("cpu", "warning", f"System at/above saturation — load/cores = {r1:.2f}")
-        elif r1 >= LOAD_HEALTHY:
+        elif r1 >= c["cpu_load_ratio_healthy"]:
             self._finding("cpu", "info", f"System approaching saturation — load/cores = {r1:.2f}")
         else:
             self._finding("cpu", "info", f"System load healthy — load/cores = {r1:.2f}")
 
-        if r1 > r5 * 1.5 and r5 > r15 * 1.5:
+        spike = c["cpu_load_spike_multiplier"]
+        sustained = c["cpu_load_sustained_mult"]
+        stable_tol = c["cpu_load_stable_tolerance"]
+        sustained_tol = c["cpu_load_sustained_tol"]
+
+        if r1 > r5 * spike and r5 > r15 * spike:
             self._finding("cpu", "warning", "Load spiking — issue started very recently")
-        elif r1 > r15 * 1.3 and abs(r1 - r5) / max(r5, 0.01) < 0.3:
+        elif r1 > r15 * sustained and abs(r1 - r5) / max(r5, 0.01) < sustained_tol:
             self._finding("cpu", "warning", "Sustained elevated load — issue started within last ~10 min")
-        elif abs(r1 - r15) / max(r15, 0.01) < 0.2:
+        elif abs(r1 - r15) / max(r15, 0.01) < stable_tol:
             self._finding("cpu", "info", "Load is stable — this is the system's normal state")
         elif r1 < r5 < r15:
             self._finding("cpu", "info", "Load is decreasing — system may be recovering")
@@ -291,10 +357,11 @@ class Troubleshooter:
 
     def _get_top_processes(self):
         procs = []
+        n = self.cfg["out_top_process_count"]
         if self.runner.is_darwin:
-            out = self.runner.run("ps -eo pid,pcpu,pmem,state,comm -r | head -20")
+            out = self.runner.run(f"ps -eo pid,pcpu,pmem,state,comm -r | head -{n}")
         else:
-            out = self.runner.run("ps -eo pid,pcpu,pmem,stat,comm --sort=-pcpu | head -20")
+            out = self.runner.run(f"ps -eo pid,pcpu,pmem,stat,comm --sort=-pcpu | head -{n}")
         for line in out.splitlines()[1:]:
             parts = line.split(None, 4)
             if len(parts) < 5:
@@ -348,12 +415,12 @@ class Troubleshooter:
         self.report.process_mem = info.get("mem", 0.0)
         self.report.process_state = info.get("state", "?")
 
-        # 3.2 Decision tree — check all branches based on metrics
+        c = self.cfg
         branches_triggered = []
 
-        if info.get("cpu", 0) > CPU_HIGH_PCT:
+        if info.get("cpu", 0) > c["cpu_process_high_pct"]:
             branches_triggered.append("cpu")
-        if info.get("mem", 0) > MEM_HIGH_PCT:
+        if info.get("mem", 0) > c["mem_process_high_pct"]:
             branches_triggered.append("memory")
         if info.get("state", "").startswith("D") or info.get("state", "").startswith("U"):
             branches_triggered.append("io")
@@ -362,10 +429,9 @@ class Troubleshooter:
         fd_limit = self._get_fd_limit(pid)
         self.report.open_files = fd_count
         self.report.file_limit = fd_limit
-        if fd_limit > 0 and fd_count / fd_limit > FD_WARNING_RATIO:
+        if fd_limit > 0 and fd_count / fd_limit > c["fd_usage_ratio_warning"]:
             branches_triggered.append("fd")
 
-        # Symptom-based branch forcing — operator hint overrides metric thresholds
         if self.symptom:
             keyword_map = {
                 "cpu": "cpu", "memory": "memory", "mem": "memory",
@@ -424,7 +490,6 @@ class Troubleshooter:
 
     def _get_fd_limit(self, pid):
         if self.runner.is_darwin:
-            # macOS has no /proc/PID/limits — use launchctl system default as approximation
             out = self.runner.run("launchctl limit maxfiles")
             parts = out.split()
             try:
@@ -445,54 +510,59 @@ class Troubleshooter:
             return
         print(f"\n── §4 CPU Investigation — PID {pid} ──\n")
 
+        c = self.cfg
         cores = self.report.cores or 1
         cpu_pct = self.report.process_cpu
         per_core = cpu_pct / cores
         print(f"  Process %CPU: {cpu_pct:.1f}% on {cores} cores ({per_core:.1f}% of total capacity)")
 
         pn = self._pn(pid)
-        if cpu_pct >= 95:
+        if cpu_pct >= c["cpu_process_critical_pct"]:
             self._finding("cpu", "critical",
                           f"{pn} consuming {cpu_pct:.1f}% CPU — saturating ~{cpu_pct/100:.0f} core(s)")
-        elif cpu_pct >= CPU_HIGH_PCT:
+        elif cpu_pct >= c["cpu_process_high_pct"]:
             self._finding("cpu", "warning", f"{pn} elevated CPU at {cpu_pct:.1f}%")
 
-        # 4.2 Duration estimate
         r1 = self.report.load_1m / cores if cores else 0
         r15 = self.report.load_15m / cores if cores else 0
-        if r1 > r15 * 1.5:
+        if r1 > r15 * c["cpu_load_spike_multiplier"]:
             self._finding("cpu", "info", "Load spike is recent (1m >> 15m) — issue started within last few minutes")
-        elif abs(r1 - r15) / max(r15, 0.01) < 0.2:
+        elif abs(r1 - r15) / max(r15, 0.01) < c["cpu_load_stable_tolerance"]:
             self._finding("cpu", "info", "Load is stable — CPU pressure may be chronic")
 
-        # 4.3 System logs
+        lookback = c["log_lookback_minutes"]
+        max_log = c["out_max_log_lines"]
+        slow_to = c["slow_command_timeout_secs"]
+
         print("\n  Checking system logs...")
         if self.runner.is_darwin:
             out = self.runner.run(
-                "log show --predicate 'messageType == error' --last 10m --style compact 2>/dev/null | tail -20",
-                timeout=15,
+                f"log show --predicate 'messageType == error' --last {lookback}m "
+                f"--style compact 2>/dev/null | tail -{max_log}",
+                timeout=slow_to,
             )
         else:
             out = self.runner.run(
-                "journalctl --since '10 minutes ago' --priority=warning --no-pager 2>/dev/null | tail -20"
+                f"journalctl --since '{lookback} minutes ago' --priority=warning "
+                f"--no-pager 2>/dev/null | tail -{max_log}"
             )
         if out.strip():
             relevant = [l for l in out.splitlines() if l.strip()]
             if relevant:
-                self._finding("cpu", "info", f"Found {len(relevant)} recent log entries (last 10m)")
+                self._finding("cpu", "info", f"Found {len(relevant)} recent log entries (last {lookback}m)")
                 for line in relevant[:5]:
                     print(f"    {line[:120]}")
         else:
             print("  No recent warning/error log entries.")
 
-        # 4.4 OOM / jetsam check
         if self.runner.is_darwin:
             out = self.runner.run(
-                "log show --predicate 'eventMessage contains \"jettisoned\"' --last 10m --style compact 2>/dev/null | tail -5",
-                timeout=15,
+                f"log show --predicate 'eventMessage contains \"jettisoned\"' --last {lookback}m "
+                f"--style compact 2>/dev/null | tail -5",
+                timeout=slow_to,
             )
             if out.strip():
-                self._finding("cpu", "warning", "macOS memory jetsam events detected in last 10 minutes")
+                self._finding("cpu", "warning", f"macOS memory jetsam events detected in last {lookback} minutes")
                 for line in out.splitlines()[:3]:
                     print(f"    {line[:120]}")
         else:
@@ -502,12 +572,12 @@ class Troubleshooter:
                 for line in out.splitlines()[:3]:
                     print(f"    {line[:120]}")
 
-        # 4.5 Thread-level breakdown
+        n_threads = c["out_top_thread_count"]
         print("\n  Thread breakdown:")
         if self.runner.is_darwin:
-            out = self.runner.run(f"ps -M -p {pid} -o pid,pcpu,comm | head -20")
+            out = self.runner.run(f"ps -M -p {pid} -o pid,pcpu,comm | head -{n_threads}")
         else:
-            out = self.runner.run(f"ps -p {pid} -L -o tid,%cpu,comm | sort -k2 -rn | head -20")
+            out = self.runner.run(f"ps -p {pid} -L -o tid,%cpu,comm | sort -k2 -rn | head -{n_threads}")
         if out.strip():
             print(f"  {out.replace(chr(10), chr(10) + '  ')}")
 
@@ -526,7 +596,7 @@ class Troubleshooter:
             return
         print(f"\n── §5 Memory Investigation — PID {pid} ──\n")
 
-        # 5.1 Process memory profile
+        c = self.cfg
         out = self.runner.run(f"ps -p {pid} -o pid,rss,vsz,%mem,comm")
         print(f"  {out}")
 
@@ -545,28 +615,29 @@ class Troubleshooter:
 
         pn = self._pn(pid)
         mem_pct = self.report.process_mem
-        if mem_pct > MEM_HIGH_PCT:
+        if mem_pct > c["mem_process_high_pct"]:
             self._finding("memory", "critical", f"{pn} RSS: {rss_mb:.0f} MB ({mem_pct:.1f}% of system)")
-        elif rss_mb > 100:
+        elif rss_mb > c["mem_rss_warning_mb"]:
             self._finding("memory", "warning", f"{pn} RSS: {rss_mb:.0f} MB ({mem_pct:.1f}% of system)")
         else:
             self._finding("memory", "info", f"{pn} RSS: {rss_mb:.0f} MB ({mem_pct:.1f}% of system)")
 
-        if vsz_mb > rss_mb * 10 and vsz_mb > 1000:
+        if vsz_mb > rss_mb * c["mem_vsz_rss_ratio_warning"] and vsz_mb > c["mem_vsz_absolute_warning_mb"]:
             self._finding("memory", "info",
                           f"{pn} VSZ ({vsz_mb:.0f} MB) is {vsz_mb/max(rss_mb,1):.0f}x RSS — large virtual reservation")
 
-        # 5.1b macOS: vmmap summary
         if self.runner.is_darwin:
             print("\n  Memory map summary:")
-            out = self.runner.run(f"vmmap --summary {pid} 2>/dev/null | tail -8", timeout=15)
+            out = self.runner.run(f"vmmap --summary {pid} 2>/dev/null | tail -8",
+                                  timeout=c["slow_command_timeout_secs"])
             if out.strip():
                 print(f"  {out.replace(chr(10), chr(10) + '  ')}")
             else:
                 print("  (vmmap not available or insufficient permissions)")
 
-        # 5.2 Swap / compression check — system-wide context, attributed only
-        # when this process is a significant contributor
+        attr_pct = c["mem_swap_attribution_pct"]
+        comp_warn = c["mem_compression_warning_mb"]
+
         print("\n  Swap & compression check (system-wide context):")
         if self.runner.is_darwin:
             out = self.runner.run("sysctl vm.swapusage")
@@ -577,8 +648,7 @@ class Troubleshooter:
                     used_val = float(match.group(1))
                     unit = match.group(2)
                     used_mb = used_val * 1024 if unit == "G" else used_val
-                    # Only attribute to this process if it's a meaningful memory consumer
-                    if used_mb > 0 and mem_pct > 5:
+                    if used_mb > 0 and mem_pct > attr_pct:
                         self._finding("memory", "warning",
                                       f"System swap in use ({used_val:.1f}{unit}) and {pn} "
                                       f"is consuming {mem_pct:.1f}% of RAM — may be contributing to swap pressure")
@@ -597,11 +667,11 @@ class Troubleshooter:
                     page_size = int(page_size_out.strip()) if page_size_out.strip().isdigit() else 16384
                     compressed_mb = int(match.group(1)) * page_size / (1024 * 1024)
                     print(f"  Compressed memory: {compressed_mb:.0f} MB")
-                    if compressed_mb > 2048 and mem_pct > 5:
+                    if compressed_mb > comp_warn and mem_pct > attr_pct:
                         self._finding("memory", "warning",
                                       f"Heavy memory compression ({compressed_mb:.0f} MB) and {pn} "
                                       f"is a significant consumer ({mem_pct:.1f}%) — may be contributing")
-                    elif compressed_mb > 2048:
+                    elif compressed_mb > comp_warn:
                         self._finding("memory", "info",
                                       f"System memory compression active ({compressed_mb:.0f} MB) — "
                                       f"not attributed to {pn} ({mem_pct:.1f}% of RAM)")
@@ -612,7 +682,7 @@ class Troubleshooter:
                 swap_match = re.search(r'VmSwap:\s+(\d+)\s+kB', out)
                 if swap_match:
                     proc_swap_mb = int(swap_match.group(1)) / 1024
-                    if proc_swap_mb > 100:
+                    if proc_swap_mb > c["mem_proc_swap_warning_mb"]:
                         self._finding("memory", "warning",
                                       f"{pn} has {proc_swap_mb:.0f} MB swapped out")
                     elif proc_swap_mb > 0:
@@ -622,10 +692,11 @@ class Troubleshooter:
             if out:
                 print(f"  {out}")
 
-        # 5.3 Memory growth trend — 3 snapshots, 3s apart
-        print("\n  RSS growth check (3 samples, 3s apart):")
+        sample_count = c["mem_rss_sample_count"]
+        sample_interval = c["mem_rss_sample_interval"]
+        print(f"\n  RSS growth check ({sample_count} samples, {sample_interval}s apart):")
         samples = []
-        for i in range(3):
+        for i in range(sample_count):
             rss = self.runner.run(f"ps -p {pid} -o rss=")
             try:
                 samples.append(int(rss.strip()))
@@ -633,22 +704,21 @@ class Troubleshooter:
                 break
             ts = datetime.now().strftime("%H:%M:%S")
             print(f"    {ts}  RSS = {samples[-1]/1024:.1f} MB")
-            if i < 2:
-                time.sleep(3)
+            if i < sample_count - 1:
+                time.sleep(sample_interval)
 
         if len(samples) >= 2:
             growth = samples[-1] - samples[0]
             growth_pct = (growth / max(samples[0], 1)) * 100
-            if growth_pct > 5:
+            if growth_pct > c["mem_rss_growth_warning_pct"]:
                 self._finding("memory", "warning",
                               f"{pn} RSS grew {growth/1024:.1f} MB ({growth_pct:.1f}%) over "
-                              f"{(len(samples)-1)*3}s — possible leak")
+                              f"{(len(samples)-1)*sample_interval}s — possible leak")
             elif growth_pct > 0:
                 self._finding("memory", "info", f"{pn} RSS grew slightly: +{growth/1024:.1f} MB ({growth_pct:.1f}%)")
             else:
                 self._finding("memory", "info", f"{pn} RSS stable during observation window")
 
-        # 5.4 System memory pressure (macOS)
         if self.runner.is_darwin:
             out = self.runner.run("memory_pressure 2>/dev/null | head -5")
             if out:
@@ -672,6 +742,7 @@ class Troubleshooter:
             return
         print(f"\n── §6 I/O Investigation — PID {pid} ──\n")
 
+        c = self.cfg
         pn = self._pn(pid)
         state = self.report.process_state
         if state.startswith("D") or state.startswith("U"):
@@ -679,23 +750,23 @@ class Troubleshooter:
         else:
             self._finding("io", "info", f"{pn} state is '{state}' — investigating I/O indicators")
 
-        # 6.1 System-level I/O stats
         print("  Disk I/O stats:")
         if self.runner.is_darwin:
             out = self.runner.run("iostat -d -c 3 -w 1 2>/dev/null")
             if out:
                 print(f"  {out.replace(chr(10), chr(10) + '  ')}")
         else:
-            out = self.runner.run("iostat -x 1 3 2>/dev/null | tail -20")
+            max_log = c["out_max_log_lines"]
+            out = self.runner.run(f"iostat -x 1 3 2>/dev/null | tail -{max_log}")
             if out:
                 print(f"  {out.replace(chr(10), chr(10) + '  ')}")
             proc_io = self.runner.run(f"cat /proc/{pid}/io 2>/dev/null")
             if proc_io:
                 print(f"\n  Process I/O counters:\n  {proc_io.replace(chr(10), chr(10) + '  ')}")
 
-        # 6.2 Identify open disk files
+        max_reg = c["out_max_reg_files"]
         print("\n  Open disk files:")
-        out = self.runner.run(f"lsof -p {pid} 2>/dev/null | grep REG | head -30")
+        out = self.runner.run(f"lsof -p {pid} 2>/dev/null | grep REG | head -{max_reg}")
         reg_count = 0
         file_dirs = set()
         if out.strip():
@@ -705,9 +776,7 @@ class Troubleshooter:
             for line in lines:
                 parts = line.split()
                 if len(parts) >= 9:
-                    path = parts[8]
-                    import os
-                    file_dirs.add(os.path.dirname(path))
+                    file_dirs.add(os.path.dirname(parts[8]))
         else:
             print("  (no regular files open)")
 
@@ -716,11 +785,10 @@ class Troubleshooter:
             reg_ratio = reg_count / total_fds
             self._finding("io", "info",
                           f"{pn} has {reg_count} regular file FDs out of {total_fds} total ({reg_ratio:.0%})")
-            if reg_ratio > 0.5 and reg_count > 10:
+            if reg_ratio > c["io_reg_fd_ratio_warning"] and reg_count > c["io_reg_fd_count_min"]:
                 self._finding("io", "warning",
                               f"{pn} has high proportion of disk file FDs — I/O heavy")
 
-        # 6.3 Map to storage devices / check disk space
         if file_dirs:
             print("\n  Filesystem usage for open file locations:")
             for d in sorted(file_dirs)[:5]:
@@ -728,11 +796,10 @@ class Troubleshooter:
                 if out:
                     print(f"    {out}")
                     match = re.search(r'(\d+)%', out)
-                    if match and int(match.group(1)) >= DISK_USAGE_WARNING:
+                    if match and int(match.group(1)) >= c["io_disk_usage_critical_pct"]:
                         self._finding("io", "critical",
                                       f"Filesystem containing {d} is {match.group(1)}% full")
 
-        # 6.4 I/O-bound heuristic — low CPU% but high cumulative time
         cpu_pct = self.report.process_cpu
         cputime_out = self.runner.run(f"ps -p {pid} -o time=")
         if cputime_out.strip():
@@ -745,20 +812,21 @@ class Troubleshooter:
                     total_secs = int(parts[0]) * 60 + float(parts[1])
                 else:
                     total_secs = 0
-                if cpu_pct < 10 and total_secs > 60:
+                if cpu_pct < c["io_iobound_cpu_max_pct"] and total_secs > c["io_iobound_cumtime_secs"]:
                     self._finding("io", "warning",
                                   f"{pn} low current CPU ({cpu_pct:.1f}%) but {total_secs:.0f}s cumulative — "
                                   f"spends significant time waiting (likely I/O)")
             except (ValueError, IndexError):
                 pass
 
-        # 6.5 Kernel I/O errors
+        lookback = c["log_lookback_minutes"]
+        slow_to = c["slow_command_timeout_secs"]
         print("\n  Checking for I/O errors in system logs...")
         if self.runner.is_darwin:
             out = self.runner.run(
-                "log show --predicate 'sender == \"kernel\" AND messageType == error' --last 10m "
-                "--style compact 2>/dev/null | grep -iE 'disk|io|storage|nand' | tail -5",
-                timeout=15,
+                f"log show --predicate 'sender == \"kernel\" AND messageType == error' --last {lookback}m "
+                f"--style compact 2>/dev/null | grep -iE 'disk|io|storage|nand' | tail -5",
+                timeout=slow_to,
             )
         else:
             out = self.runner.run("dmesg -T 2>/dev/null | grep -iE 'error.*sd|i/o error|bad sector' | tail -10")
@@ -783,6 +851,7 @@ class Troubleshooter:
             return
         print(f"\n── §7 File Descriptor Investigation — PID {pid} ──\n")
 
+        c = self.cfg
         fd_count = self.report.open_files
         fd_limit = self.report.file_limit
 
@@ -797,48 +866,44 @@ class Troubleshooter:
             if ratio >= 1.0:
                 self._finding("fd", "critical",
                               f"{pn} has REACHED FD limit ({fd_count}/{fd_limit}) — new opens will fail")
-            elif ratio >= FD_CRITICAL_RATIO:
+            elif ratio >= c["fd_usage_ratio_critical"]:
                 self._finding("fd", "critical",
                               f"{pn} at {ratio:.0%} of FD limit ({fd_count}/{fd_limit}) — approaching exhaustion")
-            elif ratio >= FD_WARNING_RATIO:
+            elif ratio >= c["fd_usage_ratio_warning"]:
                 self._finding("fd", "warning",
                               f"{pn} at {ratio:.0%} of FD limit ({fd_count}/{fd_limit})")
             else:
                 self._finding("fd", "info", f"{pn} FD usage normal ({ratio:.0%})")
 
-        # 7.1 Breakdown by type
         print("\n  FD type breakdown:")
         out = self.runner.run(f"lsof -p {pid} 2>/dev/null | awk 'NR>1 {{print $5}}' | sort | uniq -c | sort -rn")
         if out:
             print(f"  {out.replace(chr(10), chr(10) + '  ')}")
 
-        # 7.2 Top file paths
+        max_paths = c["out_max_file_paths"]
         print("\n  Top file paths:")
-        out = self.runner.run(f"lsof -p {pid} 2>/dev/null | awk 'NR>1 {{print $9}}' | sort | uniq -c | sort -rn | head -10")
+        out = self.runner.run(
+            f"lsof -p {pid} 2>/dev/null | awk 'NR>1 {{print $9}}' | sort | uniq -c | sort -rn | head -{max_paths}")
         if out:
             print(f"  {out.replace(chr(10), chr(10) + '  ')}")
 
-        # 7.3 Leak pattern classification
         print("\n  Leak pattern analysis:")
 
-        # CLOSE_WAIT sockets
-        close_wait_out = self.runner.run(
-            f"lsof -p {pid} 2>/dev/null | grep -c CLOSE_WAIT"
-        )
+        close_wait_out = self.runner.run(f"lsof -p {pid} 2>/dev/null | grep -c CLOSE_WAIT")
         try:
             close_wait = int(close_wait_out.strip())
         except (ValueError, AttributeError):
             close_wait = 0
-        if close_wait > CLOSE_WAIT_WARNING:
+        if close_wait > c["net_close_wait_warning"]:
             self._finding("fd", "warning",
                           f"{close_wait} sockets in CLOSE_WAIT — application not closing connections properly")
         elif close_wait > 0:
             print(f"    CLOSE_WAIT sockets: {close_wait}")
 
-        # Duplicate directory entries (temp file leak)
+        max_dirs = c["out_max_dir_groups"]
         dir_out = self.runner.run(
             f"lsof -p {pid} 2>/dev/null | awk 'NR>1 && $5==\"REG\" {{n=split($9,a,\"/\"); "
-            f"dir=\"\"; for(i=1;i<n;i++) dir=dir\"/\"a[i]; print dir}}' | sort | uniq -c | sort -rn | head -3"
+            f"dir=\"\"; for(i=1;i<n;i++) dir=dir\"/\"a[i]; print dir}}' | sort | uniq -c | sort -rn | head -{max_dirs}"
         )
         if dir_out.strip():
             for line in dir_out.splitlines():
@@ -846,26 +911,26 @@ class Troubleshooter:
                 if len(parts) == 2:
                     count = int(parts[0])
                     dirname = parts[1]
-                    if count > 20:
+                    if count > c["fd_dir_leak_threshold"]:
                         self._finding("fd", "warning",
                                       f"{count} file FDs in {dirname} — possible temp file leak")
 
-        # Pipe/FIFO count
         pipe_out = self.runner.run(f"lsof -p {pid} 2>/dev/null | grep -cE 'PIPE|FIFO'")
         try:
             pipe_count = int(pipe_out.strip())
         except (ValueError, AttributeError):
             pipe_count = 0
-        if pipe_count > 20:
+        if pipe_count > c["fd_pipe_warning"]:
             self._finding("fd", "warning",
                           f"{pipe_count} pipe/FIFO FDs — possible subprocess management issue")
         elif pipe_count > 0:
             print(f"    Pipes/FIFOs: {pipe_count}")
 
-        # 7.4 FD growth trend — 3 snapshots, 5s apart
-        print("\n  FD growth check (3 samples, 5s apart):")
+        fd_n = c["fd_sample_count"]
+        fd_interval = c["fd_sample_interval"]
+        print(f"\n  FD growth check ({fd_n} samples, {fd_interval}s apart):")
         fd_samples = []
-        for i in range(3):
+        for i in range(fd_n):
             count_out = self.runner.run(f"lsof -p {pid} 2>/dev/null | wc -l")
             try:
                 fd_samples.append(int(count_out.strip()))
@@ -873,14 +938,14 @@ class Troubleshooter:
                 break
             ts = datetime.now().strftime("%H:%M:%S")
             print(f"    {ts}  FDs = {fd_samples[-1]}")
-            if i < 2:
-                time.sleep(5)
+            if i < fd_n - 1:
+                time.sleep(fd_interval)
 
         if len(fd_samples) >= 2:
             growth = fd_samples[-1] - fd_samples[0]
-            if growth > 5:
+            if growth > c["fd_growth_active_leak"]:
                 self._finding("fd", "warning",
-                              f"FD count growing: +{growth} in {(len(fd_samples)-1)*5}s — active leak")
+                              f"FD count growing: +{growth} in {(len(fd_samples)-1)*fd_interval}s — active leak")
             elif growth > 0:
                 self._finding("fd", "info", f"FD count slightly increasing: +{growth}")
             else:
@@ -900,7 +965,7 @@ class Troubleshooter:
             return
         print(f"\n── §8 Network & Dependency Investigation — PID {pid} ──\n")
 
-        # 8.1 Map connections via lsof
+        c = self.cfg
         out = self.runner.run(f"lsof -p {pid} -i -n -P 2>/dev/null")
         pn = self._pn(pid)
         if not out.strip():
@@ -909,25 +974,22 @@ class Troubleshooter:
             return
 
         lines = [l for l in out.splitlines() if l.strip()]
-        header = lines[0] if lines else ""
         conn_lines = lines[1:] if len(lines) > 1 else []
+        max_display = c["net_display_max_conns"]
 
         print(f"  Network connections ({len(conn_lines)} total):")
-        for line in conn_lines[:20]:
+        for line in conn_lines[:max_display]:
             print(f"    {line}")
-        if len(conn_lines) > 20:
-            print(f"    ... and {len(conn_lines) - 20} more")
+        if len(conn_lines) > max_display:
+            print(f"    ... and {len(conn_lines) - max_display} more")
 
-        # 8.2 Connection state summary
         states = {}
         remote_endpoints = {}
         for line in conn_lines:
-            # Parse state from lsof NAME column: "host:port->host:port (STATE)"
             state_match = re.search(r'\((\w+)\)\s*$', line)
             state = state_match.group(1) if state_match else "UNKNOWN"
             states[state] = states.get(state, 0) + 1
 
-            # Parse remote endpoint
             arrow_match = re.search(r'->([\d.]+(?::\d+)?|[\w.-]+:\d+)', line)
             if arrow_match:
                 remote = arrow_match.group(1)
@@ -939,34 +1001,31 @@ class Troubleshooter:
             print(f"    {state:>15}: {count}")
 
         total_conns = len(conn_lines)
-        if total_conns >= CONN_CRITICAL:
+        if total_conns >= c["net_conn_count_critical"]:
             self._finding("network", "critical",
                           f"{pn} has {total_conns} connections — very high, possible connection leak")
-        elif total_conns >= CONN_WARNING:
+        elif total_conns >= c["net_conn_count_warning"]:
             self._finding("network", "warning", f"{pn} has {total_conns} connections — elevated")
         else:
             self._finding("network", "info", f"{pn} has {total_conns} connection(s)")
 
-        # CLOSE_WAIT detection
         close_wait = states.get("CLOSE_WAIT", 0)
-        if close_wait > CLOSE_WAIT_WARNING:
+        if close_wait > c["net_close_wait_warning"]:
             self._finding("network", "warning",
                           f"{pn} has {close_wait} connections in CLOSE_WAIT — "
                           f"remote side closed but application hasn't")
 
-        # 8.3 Queue depth check via netstat cross-reference (macOS)
         if self.runner.is_darwin:
-            # Extract local ports from lsof output
             local_ports = set()
             for line in conn_lines:
-                # Match patterns like "localhost:12345->" or "*:12345"
                 port_match = re.search(r'(?:localhost|[\d.]+|\*):(\d+)', line)
                 if port_match:
                     local_ports.add(port_match.group(1))
 
             if local_ports:
+                max_ns = c["out_max_netstat_lines"]
                 print(f"\n  Checking queue depth for {len(local_ports)} local ports...")
-                netstat_out = self.runner.run("netstat -an -p tcp 2>/dev/null | head -100")
+                netstat_out = self.runner.run(f"netstat -an -p tcp 2>/dev/null | head -{max_ns}")
                 congested = []
                 for ns_line in netstat_out.splitlines():
                     for port in local_ports:
@@ -984,8 +1043,8 @@ class Troubleshooter:
                 if congested:
                     self._finding("network", "warning",
                                   f"{pn} has {len(congested)} congested connections (non-zero queues)")
-                    for c in congested[:5]:
-                        print(f"    {c}")
+                    for item in congested[:5]:
+                        print(f"    {item}")
                 else:
                     print("  No queue congestion detected.")
         else:
@@ -1008,13 +1067,12 @@ class Troubleshooter:
                     for q in queued[:5]:
                         print(f"    {q}")
 
-        # 8.4 Remote endpoint grouping
         if remote_endpoints:
             print(f"\n  Top remote endpoints:")
             for ip, count in sorted(remote_endpoints.items(), key=lambda x: -x[1])[:5]:
                 print(f"    {ip:>20}: {count} connection(s)")
             top_ip, top_count = max(remote_endpoints.items(), key=lambda x: x[1])
-            if top_count > 10:
+            if top_count > c["net_endpoint_conc_warning"]:
                 self._finding("network", "info",
                               f"{pn} highest concentration: {top_count} connections to {top_ip}")
 
@@ -1078,9 +1136,11 @@ def main():
     parser.add_argument("--user", default=None, help="SSH user for remote hosts")
     parser.add_argument("--pid", type=int, default=None, help="Specific PID to investigate")
     parser.add_argument("--symptom", default=None, help="Symptom description")
+    parser.add_argument("--config", default=None, help="Path to settings.cfg (default: ./settings.cfg)")
     args = parser.parse_args()
 
-    runner = CommandRunner(host=args.host, ssh_user=args.user)
+    cfg = load_config(args.config)
+    runner = CommandRunner(host=args.host, ssh_user=args.user, cfg=cfg)
     ts = Troubleshooter(runner, pid=args.pid, symptom=args.symptom)
     ts.run()
 
