@@ -114,7 +114,7 @@ Every value has a sensible default built into the code, so `settings.cfg` is opt
 The test suite launches 5 safe dummy processes and runs the troubleshooter against each:
 
 ```bash
-python3 run_all_tests.py
+python3 tests/run_all_tests.py
 ```
 
 | Scenario | Dummy | What it triggers |
@@ -131,7 +131,7 @@ You can also run dummies individually:
 
 ```bash
 # Start a dummy in the background
-python3 cpu_burner.py &
+python3 tests/cpu_burner.py &
 
 # Run the troubleshooter against it
 python3 troubleshooter.py --pid $!
@@ -165,13 +165,24 @@ The troubleshooter detects the OS at runtime and uses platform-appropriate comma
 
 ```
 agentic-troubleshooting/
-  troubleshooter.py          # The agent — run this
-  settings.cfg               # Configurable thresholds and tuning
-  TROUBLESHOOTING_RUNBOOK.md # Decision tree documentation
-  run_all_tests.py           # Test runner for all 5 scenarios
-  cpu_burner.py              # Test dummy: CPU saturation
-  mem_hog.py                 # Test dummy: memory pressure
-  io_slowpoke.py             # Test dummy: I/O pressure
-  fd_leaker.py               # Test dummy: FD exhaustion
-  net_congestion.py          # Test dummy: network congestion
+  troubleshooter.py              # Entry point — run this
+  settings.cfg                   # Configurable thresholds and tuning
+  TROUBLESHOOTING_RUNBOOK.md     # Decision tree documentation
+  modules/
+    config.py                    # Settings loader (configparser)
+    models.py                    # Finding and Report dataclasses
+    runner.py                    # CommandRunner (local / SSH execution)
+    core.py                      # Troubleshooter orchestrator (triage + deep-dive)
+    cpu.py                       # §4 CPU investigation
+    memory.py                    # §5 Memory investigation
+    disk_io.py                   # §6 I/O investigation
+    fd.py                        # §7 File descriptor investigation
+    network.py                   # §8 Network investigation
+  tests/
+    run_all_tests.py             # Test runner for all 5 scenarios
+    cpu_burner.py                # Test dummy: CPU saturation
+    mem_hog.py                   # Test dummy: memory pressure
+    io_slowpoke.py               # Test dummy: I/O pressure
+    fd_leaker.py                 # Test dummy: FD exhaustion
+    net_congestion.py            # Test dummy: network congestion
 ```

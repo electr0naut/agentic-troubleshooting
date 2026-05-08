@@ -10,42 +10,42 @@ Each scenario demonstrates a different investigation branch:
 """
 import atexit
 import os
-import signal
 import subprocess
 import sys
 import time
 
 PYTHON = sys.executable
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(TESTS_DIR)
 
 SCENARIOS = [
     {
         "name": "CPU Saturation",
-        "dummy_cmd": [PYTHON, "cpu_burner.py"],
+        "dummy_cmd": [PYTHON, os.path.join(TESTS_DIR, "cpu_burner.py")],
         "ts_extra_args": [],
         "warmup": 3,
     },
     {
         "name": "Memory Pressure",
-        "dummy_cmd": [PYTHON, "mem_hog.py", "--mb", "512"],
+        "dummy_cmd": [PYTHON, os.path.join(TESTS_DIR, "mem_hog.py"), "--mb", "512"],
         "ts_extra_args": ["--symptom", "high memory"],
         "warmup": 3,
     },
     {
         "name": "I/O Pressure",
-        "dummy_cmd": [PYTHON, "io_slowpoke.py"],
+        "dummy_cmd": [PYTHON, os.path.join(TESTS_DIR, "io_slowpoke.py")],
         "ts_extra_args": ["--symptom", "slow disk io"],
         "warmup": 2,
     },
     {
         "name": "FD Exhaustion",
-        "dummy_cmd": [PYTHON, "fd_leaker.py", "--soft-limit", "256", "--target-ratio", "0.85"],
+        "dummy_cmd": [PYTHON, os.path.join(TESTS_DIR, "fd_leaker.py"), "--soft-limit", "256", "--target-ratio", "0.85"],
         "ts_extra_args": [],
         "warmup": 2,
     },
     {
         "name": "Network Congestion",
-        "dummy_cmd": [PYTHON, "net_congestion.py", "--connections", "20"],
+        "dummy_cmd": [PYTHON, os.path.join(TESTS_DIR, "net_congestion.py"), "--connections", "20"],
         "ts_extra_args": ["--symptom", "network congestion"],
         "warmup": 3,
     },
@@ -75,10 +75,9 @@ def run_scenario(scenario):
     print(f"  SCENARIO: {name}")
     print(f"{'#'*60}\n")
 
-    # Launch dummy
     dummy = subprocess.Popen(
         scenario["dummy_cmd"],
-        cwd=PROJECT_DIR,
+        cwd=ROOT_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -87,28 +86,24 @@ def run_scenario(scenario):
     pid = dummy.pid
     print(f"  Launched dummy PID {pid}: {' '.join(scenario['dummy_cmd'])}")
 
-    # Wait for dummy output (PID announcement) and warmup
     time.sleep(scenario["warmup"])
 
-    # Read any dummy stdout
     try:
         dummy.stdout.flush()
     except (ValueError, OSError):
         pass
 
-    # Run troubleshooter
     ts_cmd = [
-        PYTHON, "troubleshooter.py",
+        PYTHON, os.path.join(ROOT_DIR, "troubleshooter.py"),
         "--pid", str(pid),
     ] + scenario["ts_extra_args"]
 
     print(f"  Running troubleshooter: {' '.join(ts_cmd)}\n")
-    ts_result = subprocess.run(ts_cmd, cwd=PROJECT_DIR, capture_output=True, text=True, timeout=120)
+    ts_result = subprocess.run(ts_cmd, cwd=ROOT_DIR, capture_output=True, text=True, timeout=120)
     print(ts_result.stdout)
     if ts_result.stderr:
         print(f"  [stderr] {ts_result.stderr}", file=sys.stderr)
 
-    # Stop dummy
     dummy.terminate()
     try:
         dummy.wait(timeout=5)
